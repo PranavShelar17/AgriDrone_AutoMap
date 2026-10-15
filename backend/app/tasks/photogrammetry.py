@@ -171,6 +171,22 @@ def execute_photogrammetry_workflow(task_id_str: str):
             radiometric_calibration=task.radiometric_calibration,
         )
 
+        # Check for attached Ground Control Points (GCP)
+        staged_gcp: Optional[Tuple[str, bytes]] = None
+        if task.gcp_file_id:
+            gcp_record = db.query(SurveyFile).filter(SurveyFile.id == task.gcp_file_id).first()
+            if gcp_record:
+                try:
+                    g_path = gcp_record.blob_uri.split(f"{settings.AZURE_CONTAINER_RAW}/")[-1]
+                    if g_path.startswith("local://"):
+                        g_path = g_path.replace(f"local://{settings.AZURE_CONTAINER_RAW}/", "")
+                    gcp_bytes = storage.download_bytes(container_name=settings.AZURE_CONTAINER_RAW, blob_name=g_path)
+                    staged_gcp = (gcp_record.original_filename or "gcp_list.txt", gcp_bytes)
+                    task.gcp_applied = True
+                    append_task_log(db, task.id, f"Attached Ground Control Points file: {gcp_record.original_filename} ({len(gcp_bytes)} bytes)")
+                except Exception as g_err:
+                    append_task_log(db, task.id, f"Warning: Failed to load GCP file {task.gcp_file_id}: {str(g_err)}", "WARNING")
+
         task_name = f"AgriDrone_{survey.survey_code}_{str(task.id)[:8]}"
 
         try:
@@ -178,6 +194,7 @@ def execute_photogrammetry_workflow(task_id_str: str):
                 task_name=task_name,
                 image_files=staged_images,
                 options=options,
+                gcp_file=staged_gcp,
             )
             task.webodm_task_uuid = webodm_uuid
             task.status = "RUNNING"
@@ -185,6 +202,7 @@ def execute_photogrammetry_workflow(task_id_str: str):
             task.current_stage = "Reconstruction in progress on WebODM"
             db.commit()
             append_task_log(db, task.id, f"WebODM task created successfully. Task UUID: {webodm_uuid}")
+
         except Exception as e:
             error_msg = f"WebODM task submission failed: {str(e)}"
             task.status = "FAILED"

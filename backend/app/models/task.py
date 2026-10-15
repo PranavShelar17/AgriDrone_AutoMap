@@ -27,8 +27,14 @@ class PhotogrammetryTask(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    project_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("photogrammetry_projects.id", ondelete="SET NULL"), nullable=True, index=True)
+    gcp_file_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("survey_files.id", ondelete="SET NULL"), nullable=True)
+    gcp_applied: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     survey: Mapped["Survey"] = relationship("Survey", back_populates="photogrammetry_tasks")
-    source_file: Mapped[Optional["SurveyFile"]] = relationship("SurveyFile")
+    project = relationship("PhotogrammetryProject", back_populates="tasks")
+    source_file: Mapped[Optional["SurveyFile"]] = relationship("SurveyFile", foreign_keys=[source_file_id])
+    gcp_file: Mapped[Optional["SurveyFile"]] = relationship("SurveyFile", foreign_keys=[gcp_file_id])
     logs: Mapped[list["TaskLog"]] = relationship("TaskLog", back_populates="task", cascade="all, delete-orphan", order_by="TaskLog.id.asc()")
     map_products: Mapped[list["MapProduct"]] = relationship("MapProduct", back_populates="source_task")
 

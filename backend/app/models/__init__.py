@@ -4,6 +4,7 @@ from app.models.farm import Farm, Field
 from app.models.survey import Survey
 from app.models.file import SurveyFile
 from app.models.task import PhotogrammetryTask, TaskLog
+from app.models.project import PhotogrammetryProject
 from app.models.product import Algorithm, AlgorithmJob, MapProduct, ZonalStatistic
 from app.models.report import Report
 from app.models.audit import AuditLog
@@ -16,6 +17,7 @@ __all__ = [
     "Field",
     "Survey",
     "SurveyFile",
+    "PhotogrammetryProject",
     "PhotogrammetryTask",
     "TaskLog",
     "Algorithm",
@@ -25,3 +27,4 @@ __all__ = [
     "Report",
     "AuditLog",
 ]
+

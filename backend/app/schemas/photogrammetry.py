@@ -4,6 +4,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
+# ==========================================
+# Datasets Eligibility Schemas
+# ==========================================
 class EligibleDatasetItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -31,10 +34,62 @@ class EligibleDatasetsResponse(BaseModel):
     ineligible_count: int
 
 
+# ==========================================
+# Project Management Schemas
+# ==========================================
+class PhotogrammetryProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120, description="Project name")
+    description: Optional[str] = Field(default=None, description="Project notes or purpose")
+    farm_id: Optional[UUID] = Field(default=None, description="Associated agricultural farm")
+    field_id: Optional[UUID] = Field(default=None, description="Associated field")
+    survey_id: Optional[UUID] = Field(default=None, description="Associated flight survey")
+
+
+class PhotogrammetryProjectUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = None
+    farm_id: Optional[UUID] = None
+    field_id: Optional[UUID] = None
+    survey_id: Optional[UUID] = None
+    status: Optional[str] = None
+
+
+class PhotogrammetryProjectResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    description: Optional[str] = None
+    farm_id: Optional[UUID] = None
+    farm_name: Optional[str] = None
+    field_id: Optional[UUID] = None
+    field_name: Optional[str] = None
+    survey_id: Optional[UUID] = None
+    survey_code: Optional[str] = None
+    webodm_project_id: Optional[int] = None
+    status: str = "ACTIVE"
+    task_count: int = 0
+    latest_task_status: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PhotogrammetryProjectListResponse(BaseModel):
+    items: List[PhotogrammetryProjectResponse]
+    total: int
+    skip: int
+    limit: int
+
+
+# ==========================================
+# Task Management Schemas
+# ==========================================
 class PhotogrammetryTaskCreate(BaseModel):
     survey_id: UUID
+    project_id: Optional[UUID] = Field(default=None, description="Parent photogrammetry project")
     source_file_id: Optional[UUID] = None
-    resolution_preset: str = Field(default="HIGH_RES", description="Resolution preset: FAST | HIGH_RES | CUSTOM")
+    gcp_file_id: Optional[UUID] = Field(default=None, description="Ground Control Points file ID")
+    resolution_preset: str = Field(default="HIGH_RES", description="Resolution preset: FAST | HIGH_RES | MULTISPECTRAL | CUSTOM")
     custom_resolution_cm: Optional[float] = Field(default=None, ge=0.5, le=100.0, description="Custom GSD in cm/pixel")
     generate_dsm: bool = Field(default=True, description="Generate Digital Surface Model")
     generate_dtm: bool = Field(default=True, description="Generate Digital Terrain Model")
@@ -46,8 +101,8 @@ class PhotogrammetryTaskCreate(BaseModel):
     @classmethod
     def validate_preset(cls, v: str) -> str:
         upper = v.upper()
-        if upper not in ("FAST", "HIGH_RES", "CUSTOM"):
-            raise ValueError("resolution_preset must be one of: FAST, HIGH_RES, CUSTOM")
+        if upper not in ("FAST", "HIGH_RES", "MULTISPECTRAL", "CUSTOM"):
+            raise ValueError("resolution_preset must be one of: FAST, HIGH_RES, MULTISPECTRAL, CUSTOM")
         return upper
 
     @field_validator("feature_quality")
@@ -73,14 +128,18 @@ class PhotogrammetryTaskResponse(BaseModel):
     task_id: UUID
     survey_id: UUID
     survey_code: Optional[str] = None
+    project_id: Optional[UUID] = None
+    project_name: Optional[str] = None
     source_file_id: Optional[UUID] = None
     source_filename: Optional[str] = None
+    gcp_file_id: Optional[UUID] = None
+    gcp_applied: bool = False
     webodm_task_uuid: Optional[str] = None
     resolution_preset: str
     generate_dsm: bool
     generate_dtm: bool
     radiometric_calibration: bool
-    options: Optional[Dict[str, Any]] = None
+    options: Optional[Any] = None
     status: str
     progress_percent: int
     current_stage: Optional[str] = None
@@ -114,6 +173,38 @@ class TaskLogsResponse(BaseModel):
     total_lines: int
 
 
+# ==========================================
+# Ground Control Points (GCP) Schemas
+# ==========================================
+class GCPValidateRequest(BaseModel):
+    content: str = Field(description="Raw text content of the GCP file")
+    filename: Optional[str] = Field(default="gcp_list.txt")
+
+
+class GCPPointItem(BaseModel):
+    line: int
+    point_id: str
+    easting_x: float
+    northing_y: float
+    elevation_z: float
+    pixel_x: Optional[float] = None
+    pixel_y: Optional[float] = None
+    image_name: Optional[str] = None
+
+
+class GCPValidateResponse(BaseModel):
+    valid: bool
+    crs: Optional[str] = None
+    point_count: int
+    distinct_count: int
+    points: List[GCPPointItem]
+    errors: List[str]
+    warnings: List[str]
+
+
+# ==========================================
+# Processing Nodes & Cluster Schemas
+# ==========================================
 class ClusterStatusResponse(BaseModel):
     cluster_status: str
     is_connected: bool
@@ -127,6 +218,59 @@ class ClusterStatusResponse(BaseModel):
     timestamp: str
 
 
+class ClusterNodeItem(BaseModel):
+    id: int
+    name: str
+    hostname: str
+    port: int
+    engine: str
+    version: Optional[str] = None
+    online: bool
+    task_queue_count: int
+    available_memory_bytes: Optional[int] = None
+    available_memory_gb: Optional[float] = None
+    last_checked: str
+
+
+class ClusterNodesResponse(BaseModel):
+    nodes: List[ClusterNodeItem]
+    total: int
+    active_count: int
+
+
+# ==========================================
+# Diagnostics & Admin Schemas
+# ==========================================
+class DiagnosticsResponse(BaseModel):
+    timestamp: str
+    webodm_status: str
+    webodm_url: str
+    webodm_latency_ms: Optional[float] = None
+    authenticated: bool
+    active_nodes: int
+    total_nodes: int
+    storage_status: str
+    storage_provider: str
+    database_status: str
+    redis_status: str
+    issues: List[str]
+    recommendations: List[str]
+
+
+class PhotogrammetryAdminConfigResponse(BaseModel):
+    api_url: str
+    username: str
+    default_project_id: Optional[int] = None
+    timeout_seconds: int
+    poll_interval_seconds: int
+    max_retries: int
+    storage_provider: str
+    supported_presets: List[str]
+
+
+# ==========================================
+# Artifact Deliverables & Actions
+# ==========================================
 class ArtifactItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

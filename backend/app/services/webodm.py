@@ -210,6 +210,204 @@ class WebODMService:
             else:
                 raise WebODMError(f"Failed to create WebODM project (HTTP {create_resp.status_code}): {create_resp.text}")
 
+    def list_projects(self) -> List[Dict[str, Any]]:
+        """Lists projects from upstream WebODM server."""
+        self.authenticate()
+        headers = self._get_headers()
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.get(f"{self.api_url}/api/projects/", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("results", data) if isinstance(data, dict) else data
+            elif resp.status_code in (401, 403):
+                raise WebODMAuthenticationError("Authentication expired or invalid for WebODM projects listing.")
+            else:
+                raise WebODMError(f"Failed to list WebODM projects (HTTP {resp.status_code}): {resp.text}")
+
+    def create_webodm_project(self, name: str, description: Optional[str] = None) -> int:
+        """Creates an upstream project container on WebODM."""
+        self.authenticate()
+        headers = self._get_headers()
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.post(
+                f"{self.api_url}/api/projects/",
+                headers=headers,
+                json={"name": name, "description": description or ""},
+            )
+            if resp.status_code in (200, 201):
+                p_data = resp.json()
+                return int(p_data["id"])
+            else:
+                raise WebODMError(f"Failed to create WebODM project (HTTP {resp.status_code}): {resp.text}")
+
+    def update_webodm_project(self, project_id: int, name: Optional[str] = None, description: Optional[str] = None) -> Dict[str, Any]:
+        """Updates project metadata on WebODM."""
+        self.authenticate()
+        headers = self._get_headers()
+        payload = {}
+        if name:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.patch(f"{self.api_url}/api/projects/{project_id}/", headers=headers, json=payload)
+            if resp.status_code in (200, 201):
+                return resp.json()
+            else:
+                raise WebODMError(f"Failed to update WebODM project {project_id} (HTTP {resp.status_code}): {resp.text}")
+
+    def delete_webodm_project(self, project_id: int) -> bool:
+        """Deletes an upstream project on WebODM."""
+        self.authenticate()
+        headers = self._get_headers()
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.delete(f"{self.api_url}/api/projects/{project_id}/", headers=headers)
+            if resp.status_code in (200, 204):
+                return True
+            elif resp.status_code == 404:
+                return True
+            else:
+                raise WebODMError(f"Failed to delete WebODM project {project_id} (HTTP {resp.status_code}): {resp.text}")
+
+    def list_cluster_nodes(self) -> List[Dict[str, Any]]:
+        """Retrieves processing nodes from WebODM or NodeODM."""
+        try:
+            with httpx.Client(timeout=min(self.timeout, 5)) as client:
+                # 1. Direct NodeODM probe
+                try:
+                    node_resp = client.get(f"{self.api_url}/info")
+                    if node_resp.status_code == 200:
+                        info = node_resp.json()
+                        return [{
+                            "id": 1,
+                            "name": "NodeODM Engine",
+                            "hostname": self.api_url.replace("http://", "").replace("https://", "").split(":")[0],
+                            "port": int(self.api_url.split(":")[-1]) if ":" in self.api_url.replace("http://", "").replace("https://", "") else 80,
+                            "engine": "NodeODM",
+                            "version": info.get("version", "2.x"),
+                            "online": True,
+                            "task_queue_count": info.get("taskQueueCount", 0),
+                            "available_memory_bytes": info.get("availableMemory", 0),
+                            "available_memory_gb": round(info.get("availableMemory", 0) / (1024**3), 2) if info.get("availableMemory") else None,
+                            "last_checked": datetime.utcnow().isoformat(),
+                        }]
+                except Exception:
+                    pass
+
+                # 2. WebODM cluster nodes endpoint
+                self.authenticate()
+                resp = client.get(f"{self.api_url}/api/cluster/nodes/", headers=self._get_headers())
+                if resp.status_code == 200:
+                    raw_nodes = resp.json()
+                    nodes_list = raw_nodes.get("results", raw_nodes) if isinstance(raw_nodes, dict) else raw_nodes
+                    formatted = []
+                    for n in nodes_list:
+                        formatted.append({
+                            "id": n.get("id"),
+                            "name": n.get("name") or n.get("label") or f"Node {n.get('id')}",
+                            "hostname": n.get("hostname", "localhost"),
+                            "port": n.get("port", 3000),
+                            "engine": "WebODM Node",
+                            "version": n.get("version", "Standard"),
+                            "online": n.get("online", False),
+                            "task_queue_count": n.get("queue_count", 0),
+                            "available_memory_bytes": n.get("available_memory"),
+                            "available_memory_gb": round(n.get("available_memory", 0) / (1024**3), 2) if n.get("available_memory") else None,
+                            "last_checked": datetime.utcnow().isoformat(),
+                        })
+                    return formatted
+                else:
+                    return []
+        except Exception as e:
+            logger.warning("Could not query cluster nodes: %s", str(e))
+            return []
+
+    @staticmethod
+    def validate_gcp_format(content: str) -> Dict[str, Any]:
+        """Validates OpenDroneMap Ground Control Points (GCP) format."""
+        if not content or not content.strip():
+            return {
+                "valid": False,
+                "crs": None,
+                "points": [],
+                "point_count": 0,
+                "distinct_count": 0,
+                "errors": ["GCP file is empty."],
+                "warnings": [],
+            }
+
+        lines = [line.strip() for line in content.strip().splitlines() if line.strip() and not line.strip().startswith("#")]
+        if not lines:
+            return {
+                "valid": False,
+                "crs": None,
+                "points": [],
+                "point_count": 0,
+                "distinct_count": 0,
+                "errors": ["GCP file contains no coordinate records."],
+                "warnings": [],
+            }
+
+        crs_line = lines[0]
+        crs = crs_line
+        errors = []
+        warnings = []
+        parsed_points = []
+        unique_gcp_names = set()
+
+        if not any(token in crs_line.upper() for token in ["EPSG", "+PROJ", "WGS", "UTM", "NAD"]):
+            warnings.append(f"Header '{crs_line[:40]}' may not be a standard CRS representation. Recommended: EPSG:4326 or +proj=utm...")
+
+        data_lines = lines[1:]
+        if len(data_lines) < 3:
+            errors.append(f"At least 3 distinct Ground Control Points are required for photogrammetric georeferencing (found {len(data_lines)}).")
+
+        for idx, line in enumerate(data_lines, start=2):
+            parts = line.split()
+            if len(parts) < 3:
+                errors.append(f"Line {idx}: Insufficient coordinates (expected at least X Y Z, found '{line}').")
+                continue
+            
+            try:
+                x = float(parts[0])
+                y = float(parts[1])
+                z = float(parts[2])
+            except ValueError:
+                errors.append(f"Line {idx}: Coordinates X, Y, Z must be valid numbers (found '{parts[0]}', '{parts[1]}', '{parts[2]}').")
+                continue
+
+            px = float(parts[3]) if len(parts) > 3 and parts[3].replace(".", "", 1).isdigit() else None
+            py = float(parts[4]) if len(parts) > 4 and parts[4].replace(".", "", 1).isdigit() else None
+            img_name = parts[5] if len(parts) > 5 else None
+            point_id = parts[6] if len(parts) > 6 else f"GCP_{idx-1}"
+            unique_gcp_names.add(point_id)
+
+            parsed_points.append({
+                "line": idx,
+                "point_id": point_id,
+                "easting_x": x,
+                "northing_y": y,
+                "elevation_z": z,
+                "pixel_x": px,
+                "pixel_y": py,
+                "image_name": img_name,
+            })
+
+        distinct_count = len(unique_gcp_names) if unique_gcp_names else len(parsed_points)
+        if distinct_count < 3 and not errors:
+            errors.append(f"Only {distinct_count} unique GCP positions detected. Minimum 3 distinct locations required.")
+
+        return {
+            "valid": len(errors) == 0,
+            "crs": crs,
+            "points": parsed_points[:100],
+            "point_count": len(parsed_points),
+            "distinct_count": distinct_count,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+
     def build_options_payload(
         self,
         resolution_preset: str = "HIGH_RES",
@@ -259,8 +457,9 @@ class WebODMService:
         image_files: List[Tuple[str, bytes]],
         options: List[Dict[str, Any]],
         project_id: Optional[int] = None,
+        gcp_file: Optional[Tuple[str, bytes]] = None,
     ) -> str:
-        """Submits a photogrammetry task with image binaries to WebODM."""
+        """Submits a photogrammetry task with image binaries and optional GCP to WebODM."""
         if not image_files:
             raise WebODMError("Cannot create photogrammetry task without source images.")
 
@@ -283,6 +482,12 @@ class WebODMService:
             ("images", (filename, data, "image/jpeg" if filename.lower().endswith((".jpg", ".jpeg")) else "application/octet-stream"))
             for filename, data in image_files
         ]
+
+        # Attach Ground Control Points file if provided
+        if gcp_file:
+            gcp_filename, gcp_data = gcp_file
+            multipart_files.append(("gcp", (gcp_filename, gcp_data, "text/plain")))
+
 
         try:
             with httpx.Client(timeout=httpx.Timeout(120.0, connect=self.timeout)) as client:

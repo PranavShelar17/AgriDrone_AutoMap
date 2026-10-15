@@ -210,6 +210,24 @@ def verify_report_access(report_id: uuid.UUID, user: User, db: Session) -> Repor
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Report {report_id} not found.")
 
 
+def verify_photogrammetry_project_access(project_id: uuid.UUID, user: User, db: Session):
+    """Validate photogrammetry project exists and belongs to a farm accessible by the user."""
+    from app.models.project import PhotogrammetryProject
+    project = db.query(PhotogrammetryProject).filter(PhotogrammetryProject.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Project {project_id} not found.")
+    if user.role in (UserRole.ADMIN, UserRole.AGRONOMIST):
+        return project
+    if project.farm_id:
+        farm = db.query(Farm).filter(Farm.id == project.farm_id).first()
+        if farm and farm.owner_id == user.id:
+            return project
+    if project.created_by_id == user.id:
+        return project
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Project {project_id} not found.")
+
+
+
 # ---------------------------------------------------------------------------
 # Spatial validation utilities
 # ---------------------------------------------------------------------------

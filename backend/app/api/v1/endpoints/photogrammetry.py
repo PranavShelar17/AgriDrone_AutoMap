@@ -1,3 +1,4 @@
+import time
 import logging
 from uuid import UUID
 from typing import List, Optional
@@ -5,13 +6,16 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
+from sqlalchemy import desc, func, or_
 
 from app.api.deps import (
     get_db,
     get_current_user,
+    get_current_active_admin,
     verify_survey_access,
     verify_task_access,
+    verify_farm_access,
+    verify_photogrammetry_project_access,
 )
 from app.core.config import settings
 from app.models.tenant import User, UserRole
@@ -19,6 +23,7 @@ from app.models.survey import Survey
 from app.models.file import SurveyFile
 from app.models.farm import Farm, Field
 from app.models.task import PhotogrammetryTask, TaskLog
+from app.models.project import PhotogrammetryProject
 from app.models.product import MapProduct
 from app.models.audit import AuditLog
 from app.services.webodm import get_webodm_service
@@ -27,12 +32,22 @@ from app.tasks.photogrammetry import trigger_photogrammetry_task, append_task_lo
 from app.schemas.photogrammetry import (
     EligibleDatasetItem,
     EligibleDatasetsResponse,
+    PhotogrammetryProjectCreate,
+    PhotogrammetryProjectUpdate,
+    PhotogrammetryProjectResponse,
+    PhotogrammetryProjectListResponse,
     PhotogrammetryTaskCreate,
     PhotogrammetryTaskResponse,
     PhotogrammetryTaskListResponse,
     TaskLogItem,
     TaskLogsResponse,
+    GCPValidateRequest,
+    GCPValidateResponse,
     ClusterStatusResponse,
+    ClusterNodeItem,
+    ClusterNodesResponse,
+    DiagnosticsResponse,
+    PhotogrammetryAdminConfigResponse,
     ArtifactItem,
     ArtifactListResponse,
     TaskActionResponse,
@@ -43,6 +58,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+# ===========================================================================
+# 1. Cluster Status & Health
+# ===========================================================================
 @router.get("/cluster-status", response_model=ClusterStatusResponse, summary="Probe WebODM/NodeODM Cluster Health")
 def get_cluster_status(
     current_user: User = Depends(get_current_user),
@@ -53,6 +71,9 @@ def get_cluster_status(
     return ClusterStatusResponse(**health_data)
 
 
+# ===========================================================================
+# 2. Eligible Datasets
+# ===========================================================================
 @router.get("/eligible-datasets", response_model=EligibleDatasetsResponse, summary="List Eligible Datasets for Photogrammetry")
 def list_eligible_datasets(
     survey_id: Optional[UUID] = Query(default=None, description="Filter datasets by specific flight survey"),
@@ -101,52 +122,31 @@ def list_eligible_datasets(
         is_eligible = True
         ineligibility_reason = None
 
-        # 1. Ingestion status check
-        if sfile.ingestion_status == "REJECTED":
+        if sfile.ingestion_status != "VALIDATED":
             is_eligible = False
-            reasons = "; ".join(val_errors) if val_errors else "File failed ingestion validation"
-            ineligibility_reason = f"Rejected: {reasons}"
-
-        # 2. GeoTIFF pre-stitched check (Distinguish raw vs GeoTIFF)
-        elif sfile.file_type == "GEOTIFF" or workflow == "DIRECT_ALGORITHM_GIS":
+            ineligibility_reason = f"File is in {sfile.ingestion_status} state. Only VALIDATED files can be processed."
+        elif sfile.file_type == "GEOTIFF":
             is_eligible = False
-            ineligibility_reason = "Pre-stitched GeoTIFF rasters bypass WebODM photogrammetry and route directly to Phase 7 GIS algorithms."
-
-        # 3. Unsupported file type check
+            ineligibility_reason = "Pre-stitched GeoTIFF raster detected. Eligible for Phase 7 Direct GIS Indices, not SfM Photogrammetry."
         elif sfile.file_type not in ("RAW_IMAGE", "RAW_ZIP"):
             is_eligible = False
-            ineligibility_reason = f"Unsupported file type for photogrammetry: {sfile.file_type}"
-
-        # 4. Storage accessibility check
-        else:
-            blob_path = sfile.blob_uri.split(f"{settings.AZURE_CONTAINER_RAW}/")[-1]
-            if blob_path.startswith("local://"):
-                blob_path = blob_path.replace(f"local://{settings.AZURE_CONTAINER_RAW}/", "")
-
-            try:
-                if not storage.file_exists(settings.AZURE_CONTAINER_RAW, blob_path):
-                    is_eligible = False
-                    ineligibility_reason = "Dataset file is not accessible on the storage backend."
-            except Exception:
-                is_eligible = False
-                ineligibility_reason = "Storage backend verification failed for this file."
-
-        # 5. Check if survey has active processing conflict
-        if is_eligible and survey.id in active_survey_tasks:
+            ineligibility_reason = f"Unsupported file type '{sfile.file_type}' for photogrammetry reconstruction."
+        elif val_errors:
             is_eligible = False
-            ineligibility_reason = "Survey currently has an active photogrammetry reconstruction job running."
+            ineligibility_reason = f"Dataset contains validation errors: {', '.join(val_errors[:2])}"
+        elif survey.id in active_survey_tasks:
+            is_eligible = False
+            ineligibility_reason = "A photogrammetry task is already active or queued for this survey."
 
         if is_eligible:
             eligible_count += 1
         else:
             ineligible_count += 1
 
-        photo_count = sub_meta.get("extracted_image_count") if sfile.file_type == "RAW_ZIP" else 1
-
         items.append(
             EligibleDatasetItem(
                 file_id=sfile.id,
-                survey_id=sfile.survey_id,
+                survey_id=survey.id,
                 survey_code=survey.survey_code,
                 farm_name=farm.name,
                 field_name=field.field_name,
@@ -157,7 +157,7 @@ def list_eligible_datasets(
                 workflow_route=workflow,
                 is_eligible=is_eligible,
                 ineligibility_reason=ineligibility_reason,
-                photo_count_estimate=photo_count,
+                photo_count_estimate=sub_meta.get("valid_images_count") or (1 if sfile.file_type == "RAW_IMAGE" else None),
                 camera_model=sub_meta.get("camera_model"),
                 created_at=sfile.created_at,
             )
@@ -171,6 +171,427 @@ def list_eligible_datasets(
     )
 
 
+# ===========================================================================
+# 3. Photogrammetry Projects CRUD
+# ===========================================================================
+@router.get("/projects", response_model=PhotogrammetryProjectListResponse, summary="List Photogrammetry Projects")
+def list_photogrammetry_projects(
+    search: Optional[str] = Query(default=None, description="Search by project name or description"),
+    farm_id: Optional[UUID] = Query(default=None, description="Filter by farm"),
+    status: Optional[str] = Query(default=None, description="Filter by project status"),
+    sort_by: str = Query(default="created_at", description="Field to sort by: created_at | name"),
+    order: str = Query(default="desc", description="Sort order: asc | desc"),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PhotogrammetryProjectListResponse:
+    """Lists photogrammetry projects with tenant isolation, search, and task aggregation."""
+    query = db.query(PhotogrammetryProject)
+
+    if current_user.role == UserRole.FARMER:
+        # Farmer sees projects linked to their farm or created by them
+        query = query.outerjoin(Farm, PhotogrammetryProject.farm_id == Farm.id).filter(
+            or_(
+                Farm.owner_id == current_user.id,
+                PhotogrammetryProject.created_by_id == current_user.id,
+            )
+        )
+
+    if search:
+        search_pattern = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                PhotogrammetryProject.name.ilike(search_pattern),
+                PhotogrammetryProject.description.ilike(search_pattern),
+            )
+        )
+
+    if farm_id:
+        query = query.filter(PhotogrammetryProject.farm_id == farm_id)
+
+    if status:
+        query = query.filter(PhotogrammetryProject.status == status.upper())
+
+    total = query.count()
+
+    # Sort
+    sort_column = PhotogrammetryProject.name if sort_by == "name" else PhotogrammetryProject.created_at
+    if order.lower() == "asc":
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc())
+
+    projects = query.offset(skip).limit(limit).all()
+
+    items: List[PhotogrammetryProjectResponse] = []
+    for p in projects:
+        # Task counters and latest task status
+        tasks = p.tasks
+        task_count = len(tasks)
+        latest_status = tasks[0].status if tasks else None
+
+        items.append(
+            PhotogrammetryProjectResponse(
+                id=p.id,
+                name=p.name,
+                description=p.description,
+                farm_id=p.farm_id,
+                farm_name=p.farm.name if p.farm else None,
+                field_id=p.field_id,
+                field_name=p.field.field_name if p.field else None,
+                survey_id=p.survey_id,
+                survey_code=p.survey.survey_code if p.survey else None,
+                webodm_project_id=p.webodm_project_id,
+                status=p.status,
+                task_count=task_count,
+                latest_task_status=latest_status,
+                created_at=p.created_at,
+                updated_at=p.updated_at,
+            )
+        )
+
+    return PhotogrammetryProjectListResponse(
+        items=items,
+        total=total,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.post("/projects", response_model=PhotogrammetryProjectResponse, status_code=status.HTTP_201_CREATED, summary="Create Photogrammetry Project")
+def create_photogrammetry_project(
+    payload: PhotogrammetryProjectCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PhotogrammetryProjectResponse:
+    """Creates a new photogrammetry project container and optionally creates corresponding upstream WebODM project."""
+    # Validate farm access if provided
+    farm = None
+    if payload.farm_id:
+        farm = verify_farm_access(payload.farm_id, current_user, db)
+
+    # Validate survey access if provided
+    survey = None
+    if payload.survey_id:
+        survey = verify_survey_access(payload.survey_id, current_user, db)
+
+    # Validate field if provided
+    field = None
+    if payload.field_id:
+        field = db.query(Field).filter(Field.id == payload.field_id).first()
+        if not field:
+            raise HTTPException(status_code=404, detail="Associated field not found.")
+
+    # Create local project
+    project = PhotogrammetryProject(
+        name=payload.name.strip(),
+        description=payload.description.strip() if payload.description else None,
+        farm_id=payload.farm_id,
+        field_id=payload.field_id,
+        survey_id=payload.survey_id,
+        created_by_id=current_user.id,
+        status="ACTIVE",
+    )
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+
+    # Attempt upstream WebODM project creation if service is reachable
+    webodm = get_webodm_service()
+    try:
+        upstream_id = webodm.create_webodm_project(name=project.name, description=project.description)
+        project.webodm_project_id = upstream_id
+        db.commit()
+        db.refresh(project)
+    except Exception as e:
+        logger.info("Upstream WebODM project creation skipped or unavailable: %s", str(e))
+
+    # Audit log
+    audit = AuditLog(
+        user_id=current_user.id,
+        action="CREATE_PHOTOGRAMMETRY_PROJECT",
+        entity_type="photogrammetry_projects",
+        entity_id=project.id,
+    )
+    db.add(audit)
+    db.commit()
+
+    return PhotogrammetryProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        farm_id=project.farm_id,
+        farm_name=farm.name if farm else None,
+        field_id=project.field_id,
+        field_name=field.field_name if field else None,
+        survey_id=project.survey_id,
+        survey_code=survey.survey_code if survey else None,
+        webodm_project_id=project.webodm_project_id,
+        status=project.status,
+        task_count=0,
+        latest_task_status=None,
+        created_at=project.created_at,
+        updated_at=project.updated_at,
+    )
+
+
+@router.get("/projects/{project_id}", response_model=PhotogrammetryProjectResponse, summary="Get Project Details")
+def get_photogrammetry_project(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PhotogrammetryProjectResponse:
+    """Retrieves full details of a specific photogrammetry project with permission verification."""
+    project = verify_photogrammetry_project_access(project_id, current_user, db)
+    tasks = project.tasks
+    return PhotogrammetryProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        farm_id=project.farm_id,
+        farm_name=project.farm.name if project.farm else None,
+        field_id=project.field_id,
+        field_name=project.field.field_name if project.field else None,
+        survey_id=project.survey_id,
+        survey_code=project.survey.survey_code if project.survey else None,
+        webodm_project_id=project.webodm_project_id,
+        status=project.status,
+        task_count=len(tasks),
+        latest_task_status=tasks[0].status if tasks else None,
+        created_at=project.created_at,
+        updated_at=project.updated_at,
+    )
+
+
+@router.patch("/projects/{project_id}", response_model=PhotogrammetryProjectResponse, summary="Update Project Details")
+def update_photogrammetry_project(
+    project_id: UUID,
+    payload: PhotogrammetryProjectUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PhotogrammetryProjectResponse:
+    """Updates a photogrammetry project's name, notes, or domain associations."""
+    project = verify_photogrammetry_project_access(project_id, current_user, db)
+
+    if payload.name is not None:
+        project.name = payload.name.strip()
+    if payload.description is not None:
+        project.description = payload.description.strip()
+    if payload.farm_id is not None:
+        verify_farm_access(payload.farm_id, current_user, db)
+        project.farm_id = payload.farm_id
+    if payload.field_id is not None:
+        project.field_id = payload.field_id
+    if payload.survey_id is not None:
+        verify_survey_access(payload.survey_id, current_user, db)
+        project.survey_id = payload.survey_id
+    if payload.status is not None:
+        project.status = payload.status.upper()
+
+    project.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(project)
+
+    # Sync upstream WebODM project if configured
+    if project.webodm_project_id:
+        try:
+            webodm = get_webodm_service()
+            webodm.update_webodm_project(project.webodm_project_id, name=project.name, description=project.description)
+        except Exception as e:
+            logger.warning("Could not sync project rename with WebODM: %s", str(e))
+
+    tasks = project.tasks
+    return PhotogrammetryProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        farm_id=project.farm_id,
+        farm_name=project.farm.name if project.farm else None,
+        field_id=project.field_id,
+        field_name=project.field.field_name if project.field else None,
+        survey_id=project.survey_id,
+        survey_code=project.survey.survey_code if project.survey else None,
+        webodm_project_id=project.webodm_project_id,
+        status=project.status,
+        task_count=len(tasks),
+        latest_task_status=tasks[0].status if tasks else None,
+        created_at=project.created_at,
+        updated_at=project.updated_at,
+    )
+
+
+@router.delete("/projects/{project_id}", response_model=TaskActionResponse, summary="Delete Project")
+def delete_photogrammetry_project(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TaskActionResponse:
+    """Deletes a photogrammetry project after confirming authorization and cleaning up upstream containers."""
+    project = verify_photogrammetry_project_access(project_id, current_user, db)
+
+    # Clean up upstream WebODM project container if mapped
+    if project.webodm_project_id:
+        try:
+            webodm = get_webodm_service()
+            webodm.delete_webodm_project(project.webodm_project_id)
+        except Exception as e:
+            logger.warning("Upstream WebODM project deletion notice: %s", str(e))
+
+    # Audit log
+    audit = AuditLog(
+        user_id=current_user.id,
+        action="DELETE_PHOTOGRAMMETRY_PROJECT",
+        entity_type="photogrammetry_projects",
+        entity_id=project.id,
+    )
+    db.add(audit)
+
+    db.delete(project)
+    db.commit()
+
+    return TaskActionResponse(
+        task_id=project_id,
+        status="DELETED",
+        message=f"Project '{project.name}' deleted successfully.",
+    )
+
+
+# ===========================================================================
+# 4. Ground Control Points (GCP)
+# ===========================================================================
+@router.post("/gcp/validate", response_model=GCPValidateResponse, summary="Validate Ground Control Points (GCP) File")
+def validate_gcp_file(
+    payload: GCPValidateRequest,
+    current_user: User = Depends(get_current_user),
+) -> GCPValidateResponse:
+    """
+    Parses and validates OpenDroneMap Ground Control Points format (`gcp_list.txt`).
+    Checks CRS definition, coordinate bounds, minimum required points (>= 3), and format integrity.
+    """
+    webodm = get_webodm_service()
+    res = webodm.validate_gcp_format(payload.content)
+    return GCPValidateResponse(**res)
+
+
+# ===========================================================================
+# 5. Processing Nodes & Cluster Telemetry
+# ===========================================================================
+@router.get("/nodes", response_model=ClusterNodesResponse, summary="List Active Processing Nodes")
+def list_processing_nodes(
+    current_admin: User = Depends(get_current_active_admin),
+) -> ClusterNodesResponse:
+    """
+    Retrieves real-time processing node status, queue depth, and memory telemetry
+    from the connected WebODM cluster or NodeODM instance. Administrator-only.
+    """
+    webodm = get_webodm_service()
+    nodes_data = webodm.list_cluster_nodes()
+    active_count = sum(1 for n in nodes_data if n.get("online", False))
+    return ClusterNodesResponse(
+        nodes=[ClusterNodeItem(**n) for n in nodes_data],
+        total=len(nodes_data),
+        active_count=active_count,
+    )
+
+
+# ===========================================================================
+# 6. Diagnostics Engine
+# ===========================================================================
+@router.get("/diagnostics", response_model=DiagnosticsResponse, summary="Full Photogrammetry Diagnostics Probe")
+def run_photogrammetry_diagnostics(
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_active_admin),
+) -> DiagnosticsResponse:
+    """
+    Executes a comprehensive health check across WebODM cluster, storage engine,
+    PostgreSQL/PostGIS database, and Redis Celery queues.
+    """
+    webodm = get_webodm_service()
+    storage = get_storage_service()
+
+    start_probe = time.time()
+    cluster_health = webodm.check_cluster_health()
+    webodm_latency = round((time.time() - start_probe) * 1000, 2)
+
+    issues = []
+    recommendations = []
+
+    # WebODM Status
+    webodm_online = cluster_health.get("is_connected", False)
+    if not webodm_online:
+        issues.append(f"WebODM / NodeODM is unreachable at {webodm.api_url}: {cluster_health.get('error_message')}")
+        recommendations.append("Ensure NodeODM or WebODM docker container is running: docker run -p 3001:3000 opendronemap/nodeodm:latest")
+
+    # DB Status
+    db_status = "HEALTHY"
+    try:
+        db.execute(func.now())
+    except Exception as d_err:
+        db_status = "UNHEALTHY"
+        issues.append(f"Database error: {str(d_err)}")
+        recommendations.append("Verify PostGIS container connectivity on port 5434.")
+
+    # Storage Status
+    storage_status = "HEALTHY"
+    try:
+        storage_status = "HEALTHY" if storage.provider_name else "DEGRADED"
+    except Exception as s_err:
+        storage_status = "UNHEALTHY"
+        issues.append(f"Storage probe error: {str(s_err)}")
+
+    # Redis / Celery Status
+    redis_status = "HEALTHY"
+    try:
+        import redis
+        r = redis.Redis.from_url(settings.REDIS_URL, socket_timeout=2)
+        r.ping()
+    except Exception as r_err:
+        redis_status = "OFFLINE"
+        issues.append(f"Redis queue unreachable: {str(r_err)}")
+        recommendations.append("Verify Redis container is active on port 6380.")
+
+    return DiagnosticsResponse(
+        timestamp=datetime.utcnow().isoformat(),
+        webodm_status=cluster_health.get("cluster_status", "OFFLINE"),
+        webodm_url=webodm.api_url,
+        webodm_latency_ms=webodm_latency if webodm_online else None,
+        authenticated=cluster_health.get("is_connected", False),
+        active_nodes=cluster_health.get("active_nodes", 0),
+        total_nodes=cluster_health.get("total_nodes", 0),
+        storage_status=storage_status,
+        storage_provider=storage.provider_name,
+        database_status=db_status,
+        redis_status=redis_status,
+        issues=issues,
+        recommendations=recommendations,
+    )
+
+
+# ===========================================================================
+# 7. Admin Configuration Inspection
+# ===========================================================================
+@router.get("/admin/config", response_model=PhotogrammetryAdminConfigResponse, summary="Inspect Photogrammetry Configuration")
+def get_photogrammetry_admin_config(
+    current_admin: User = Depends(get_current_active_admin),
+) -> PhotogrammetryAdminConfigResponse:
+    """Administrator-only configuration inspection for WebODM and storage parameters."""
+    storage = get_storage_service()
+    return PhotogrammetryAdminConfigResponse(
+        api_url=settings.WEBODM_API_URL,
+        username=settings.WEBODM_USERNAME,
+        default_project_id=settings.WEBODM_PROJECT_ID,
+        timeout_seconds=settings.WEBODM_TIMEOUT_SECONDS,
+        poll_interval_seconds=settings.WEBODM_POLL_INTERVAL_SECONDS,
+        max_retries=settings.WEBODM_MAX_RETRIES,
+        storage_provider=storage.provider_name,
+        supported_presets=["FAST", "HIGH_RES", "MULTISPECTRAL", "CUSTOM"],
+    )
+
+
+# ===========================================================================
+# 8. Tasks CRUD & Execution
+# ===========================================================================
 @router.post("/tasks", response_model=PhotogrammetryTaskResponse, status_code=status.HTTP_202_ACCEPTED, summary="Dispatch Photogrammetry Reconstruction Task")
 def create_photogrammetry_task(
     payload: PhotogrammetryTaskCreate,
@@ -184,7 +605,12 @@ def create_photogrammetry_task(
     # 1. Survey existence & authorization check
     survey = verify_survey_access(payload.survey_id, current_user, db)
 
-    # 2. Source file validation if specified
+    # 2. Project association check if provided
+    project = None
+    if payload.project_id:
+        project = verify_photogrammetry_project_access(payload.project_id, current_user, db)
+
+    # 3. Source file validation if specified
     source_file: Optional[SurveyFile] = None
     if payload.source_file_id:
         source_file = (
@@ -210,7 +636,6 @@ def create_photogrammetry_task(
                 detail="Pre-stitched GeoTIFF rasters cannot be submitted for WebODM photogrammetry. Use Phase 7 Direct GIS processing.",
             )
     else:
-        # Check if survey has any validated raw photo files
         valid_files_count = (
             db.query(SurveyFile)
             .filter(
@@ -226,7 +651,17 @@ def create_photogrammetry_task(
                 detail=f"Survey '{survey.survey_code}' has no validated raw drone photographs to process.",
             )
 
-    # 3. Concurrency / Duplicate check
+    # 4. GCP File verification if attached
+    gcp_file = None
+    if payload.gcp_file_id:
+        gcp_file = db.query(SurveyFile).filter(SurveyFile.id == payload.gcp_file_id, SurveyFile.survey_id == payload.survey_id).first()
+        if not gcp_file:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"GCP file '{payload.gcp_file_id}' does not belong to survey '{payload.survey_id}'.",
+            )
+
+    # 5. Concurrency / Duplicate check
     active_task = (
         db.query(PhotogrammetryTask)
         .filter(
@@ -238,43 +673,49 @@ def create_photogrammetry_task(
     if active_task:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"A photogrammetry task (ID: {active_task.id}) is already active ({active_task.status}) for survey '{survey.survey_code}'. Wait for completion or cancel it before starting another run.",
+            detail=f"A photogrammetry task is already active or queued for survey '{survey.survey_code}' ({active_task.id}) in '{active_task.status}' state.",
         )
 
-    # 4. Construct task options JSONB
-    task_options = {
-        "resolution_preset": payload.resolution_preset,
-        "custom_resolution_cm": payload.custom_resolution_cm,
-        "generate_dsm": payload.generate_dsm,
-        "generate_dtm": payload.generate_dtm,
-        "radiometric_calibration": payload.radiometric_calibration,
-        "feature_quality": payload.feature_quality,
-        "pc_quality": payload.pc_quality,
-    }
+    # 6. Build options
+    webodm = get_webodm_service()
+    options_payload = webodm.build_options_payload(
+        resolution_preset=payload.resolution_preset,
+        custom_resolution_cm=payload.custom_resolution_cm,
+        generate_dsm=payload.generate_dsm,
+        generate_dtm=payload.generate_dtm,
+        radiometric_calibration=payload.radiometric_calibration,
+        feature_quality=payload.feature_quality,
+        pc_quality=payload.pc_quality,
+    )
 
-    # 5. Insert Task record
+    # 7. Create Task Record
     new_task = PhotogrammetryTask(
         survey_id=payload.survey_id,
+        project_id=payload.project_id,
         source_file_id=payload.source_file_id,
+        gcp_file_id=payload.gcp_file_id,
+        gcp_applied=bool(payload.gcp_file_id),
         resolution_preset=payload.resolution_preset,
         generate_dsm=payload.generate_dsm,
         generate_dtm=payload.generate_dtm,
         radiometric_calibration=payload.radiometric_calibration,
-        options=task_options,
+        options=options_payload,
         status="SUBMITTED",
         progress_percent=0,
-        current_stage="Job submitted to queue",
+        current_stage="Task queued in AgriDrone pipeline",
         started_at=datetime.utcnow(),
     )
     db.add(new_task)
     db.commit()
     db.refresh(new_task)
 
-    # 6. Initial task log
-    append_task_log(db, new_task.id, f"Photogrammetry job submitted by administrator {current_user.email}")
+    # 8. Initial task log
+    append_task_log(db, new_task.id, f"Photogrammetry job submitted by {current_user.email}")
     append_task_log(db, new_task.id, f"Preset: {payload.resolution_preset} | DSM: {payload.generate_dsm} | DTM: {payload.generate_dtm}")
+    if new_task.gcp_applied:
+        append_task_log(db, new_task.id, f"Ground Control Points attached: File {payload.gcp_file_id}")
 
-    # 7. Audit log
+    # 9. Audit log
     audit_entry = AuditLog(
         user_id=current_user.id,
         action="DISPATCH_PHOTOGRAMMETRY",
@@ -284,15 +725,19 @@ def create_photogrammetry_task(
     db.add(audit_entry)
     db.commit()
 
-    # 8. Dispatch asynchronous background execution
+    # 10. Dispatch asynchronous background execution
     trigger_photogrammetry_task(new_task.id)
 
     return PhotogrammetryTaskResponse(
         task_id=new_task.id,
         survey_id=new_task.survey_id,
         survey_code=survey.survey_code,
+        project_id=new_task.project_id,
+        project_name=project.name if project else None,
         source_file_id=new_task.source_file_id,
         source_filename=source_file.original_filename if source_file else None,
+        gcp_file_id=new_task.gcp_file_id,
+        gcp_applied=new_task.gcp_applied,
         webodm_task_uuid=new_task.webodm_task_uuid,
         resolution_preset=new_task.resolution_preset,
         generate_dsm=new_task.generate_dsm,
@@ -313,6 +758,7 @@ def create_photogrammetry_task(
 @router.get("/tasks", response_model=PhotogrammetryTaskListResponse, summary="List Photogrammetry Tasks")
 def list_photogrammetry_tasks(
     survey_id: Optional[UUID] = Query(default=None, description="Filter by flight survey"),
+    project_id: Optional[UUID] = Query(default=None, description="Filter by project"),
     status: Optional[str] = Query(default=None, description="Filter by task status"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=100),
@@ -327,6 +773,8 @@ def list_photogrammetry_tasks(
 
     if survey_id:
         query = query.filter(PhotogrammetryTask.survey_id == survey_id)
+    if project_id:
+        query = query.filter(PhotogrammetryTask.project_id == project_id)
     if status:
         query = query.filter(PhotogrammetryTask.status == status.upper())
 
@@ -348,8 +796,12 @@ def list_photogrammetry_tasks(
                 task_id=task.id,
                 survey_id=task.survey_id,
                 survey_code=survey.survey_code,
+                project_id=task.project_id,
+                project_name=task.project.name if task.project else None,
                 source_file_id=task.source_file_id,
                 source_filename=source_filename,
+                gcp_file_id=task.gcp_file_id,
+                gcp_applied=task.gcp_applied,
                 webodm_task_uuid=task.webodm_task_uuid,
                 resolution_preset=task.resolution_preset,
                 generate_dsm=task.generate_dsm,
@@ -376,15 +828,15 @@ def list_photogrammetry_tasks(
 
 
 @router.get("/tasks/{task_id}", response_model=PhotogrammetryTaskResponse, summary="Get Photogrammetry Task Details")
-def get_photogrammetry_task(
+def get_photogrammetry_task_detail(
     task_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> PhotogrammetryTaskResponse:
-    """Retrieves detailed status, progress, and stage metrics for a specific photogrammetry task."""
+    """Retrieves full details of a specific photogrammetry task."""
     task = verify_task_access(task_id, current_user, db)
-
     survey = db.query(Survey).filter(Survey.id == task.survey_id).first()
+
     source_filename = None
     if task.source_file_id:
         sfile = db.query(SurveyFile).filter(SurveyFile.id == task.source_file_id).first()
@@ -397,8 +849,12 @@ def get_photogrammetry_task(
         task_id=task.id,
         survey_id=task.survey_id,
         survey_code=survey.survey_code if survey else None,
+        project_id=task.project_id,
+        project_name=task.project.name if task.project else None,
         source_file_id=task.source_file_id,
         source_filename=source_filename,
+        gcp_file_id=task.gcp_file_id,
+        gcp_applied=task.gcp_applied,
         webodm_task_uuid=task.webodm_task_uuid,
         resolution_preset=task.resolution_preset,
         generate_dsm=task.generate_dsm,
@@ -419,52 +875,50 @@ def get_photogrammetry_task(
 @router.get("/tasks/{task_id}/logs", response_model=TaskLogsResponse, summary="Get Task Console Logs")
 def get_task_logs(
     task_id: UUID,
-    limit: int = Query(default=500, ge=1, le=2000),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TaskLogsResponse:
-    """Retrieves real-time console execution logs stored for the task."""
+    """Retrieves sequential execution logs for a photogrammetry task."""
     task = verify_task_access(task_id, current_user, db)
 
     logs = (
         db.query(TaskLog)
-        .filter(TaskLog.task_id == task_id)
+        .filter(TaskLog.task_id == task.id)
         .order_by(TaskLog.id.asc())
-        .limit(limit)
         .all()
     )
 
     items = [
         TaskLogItem(
-            id=log.id,
-            task_id=log.task_id,
-            log_level=log.log_level,
-            message=log.message,
-            logged_at=log.logged_at,
+            id=l.id,
+            task_id=l.task_id,
+            log_level=l.log_level,
+            message=l.message,
+            logged_at=l.logged_at,
         )
-        for log in logs
+        for l in logs
     ]
 
     return TaskLogsResponse(
-        task_id=task_id,
+        task_id=task.id,
         logs=items,
         total_lines=len(items),
     )
 
 
 @router.get("/tasks/{task_id}/artifacts", response_model=ArtifactListResponse, summary="List Generated Output Deliverables")
-def get_task_artifacts(
+def list_task_artifacts(
     task_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ArtifactListResponse:
-    """Lists registered MapProduct outputs (orthophoto, DSM, DTM) generated by this photogrammetry run."""
+    """Lists validated geospatial raster deliverables produced by a completed photogrammetry task."""
     task = verify_task_access(task_id, current_user, db)
 
     products = (
         db.query(MapProduct)
-        .filter(MapProduct.source_task_id == task_id)
-        .order_by(MapProduct.created_at.asc())
+        .filter(MapProduct.source_task_id == task.id)
+        .order_by(desc(MapProduct.created_at))
         .all()
     )
 
@@ -474,19 +928,19 @@ def get_task_artifacts(
             survey_id=p.survey_id,
             source_task_id=p.source_task_id,
             product_type=p.product_type,
-            original_filename=f"{p.product_type.lower()}_{str(p.id)[:8]}.tif",
+            original_filename=p.blob_uri.split("/")[-1] if p.blob_uri else f"{p.product_type.lower()}.tif",
             blob_uri=p.blob_uri,
             is_cog=p.is_cog,
             band_count=p.band_count,
-            crs_epsg=p.crs_epsg,
-            resolution_cm_px=float(p.resolution_cm_px) if p.resolution_cm_px else None,
+            crs_epsg=str(p.crs_epsg) if p.crs_epsg else "Unknown",
+            resolution_cm_px=float(p.resolution_cm_px) if p.resolution_cm_px is not None else None,
             created_at=p.created_at,
         )
         for p in products
     ]
 
     return ArtifactListResponse(
-        task_id=task_id,
+        task_id=task.id,
         survey_id=task.survey_id,
         items=items,
         total=len(items),
@@ -499,47 +953,41 @@ def cancel_photogrammetry_task(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TaskActionResponse:
-    """Cancels an active or queued photogrammetry task."""
+    """Cancels an active or queued photogrammetry task and dispatches cancellation to WebODM."""
     task = verify_task_access(task_id, current_user, db)
 
     if task.status in ("COMPLETED", "FAILED", "CANCELLED"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot cancel task in terminal state '{task.status}'.",
+            detail=f"Cannot cancel task {task.id} because it is already in terminal state '{task.status}'.",
         )
 
-    task.status = "CANCEL_REQUESTED"
-    db.commit()
-    append_task_log(db, task.id, f"Cancellation requested by {current_user.email}", "WARNING")
-
-    # If webodm_task_uuid exists, invoke cancel on WebODM directly
-    webodm = get_webodm_service()
+    # 1. Forward cancel to WebODM if task has upstream UUID
     if task.webodm_task_uuid:
+        webodm = get_webodm_service()
         try:
             webodm.cancel_task(task.webodm_task_uuid)
-            task.status = "CANCELLED"
-            task.completed_at = datetime.utcnow()
-            task.current_stage = "Cancelled by user"
-            db.commit()
-            append_task_log(db, task.id, "WebODM task successfully cancelled.", "WARNING")
         except Exception as e:
-            logger.warning("Error issuing cancel to WebODM: %s", str(e))
-    else:
-        task.status = "CANCELLED"
-        task.completed_at = datetime.utcnow()
-        task.current_stage = "Cancelled before dispatch"
-        db.commit()
+            logger.warning("Upstream WebODM cancel failed for task %s: %s", task.id, str(e))
 
-    # Reset survey status
+    # 2. Update local state
+    task.status = "CANCELLED"
+    task.current_stage = "Task cancelled by user"
+    task.completed_at = datetime.utcnow()
+    db.commit()
+
+    append_task_log(db, task.id, f"Photogrammetry task cancelled by user {current_user.email}", "WARNING")
+
+    # 3. Update survey state
     survey = db.query(Survey).filter(Survey.id == task.survey_id).first()
-    if survey and survey.status == "PROCESSING":
+    if survey:
         survey.status = "DRAFT"
         db.commit()
 
     return TaskActionResponse(
         task_id=task.id,
-        status=task.status,
-        message="Task cancellation processed successfully.",
+        status="CANCELLED",
+        message="Task cancelled successfully.",
     )
 
 
@@ -549,54 +997,77 @@ def retry_photogrammetry_task(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> PhotogrammetryTaskResponse:
-    """Re-dispatches a failed or cancelled photogrammetry task with fresh execution."""
+    """Retries a failed or cancelled photogrammetry task, incrementing retry counter."""
     task = verify_task_access(task_id, current_user, db)
 
     if task.status not in ("FAILED", "CANCELLED"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot retry task in state '{task.status}'. Only FAILED or CANCELLED tasks can be retried.",
+            detail=f"Cannot retry task {task.id} because it is currently in '{task.status}' state. Only FAILED or CANCELLED tasks can be retried.",
         )
 
-    task.retry_count += 1
+    if task.retry_count >= settings.WEBODM_MAX_RETRIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum retry limit ({settings.WEBODM_MAX_RETRIES}) reached for task {task.id}.",
+        )
+
+    # Check concurrency
+    active_task = (
+        db.query(PhotogrammetryTask)
+        .filter(
+            PhotogrammetryTask.survey_id == task.survey_id,
+            PhotogrammetryTask.id != task.id,
+            PhotogrammetryTask.status.in_(["SUBMITTED", "QUEUED", "PREPARING", "UPLOADING", "RUNNING", "FINALIZING"]),
+        )
+        .first()
+    )
+    if active_task:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot retry: Survey already has an active task ({active_task.id}) in '{active_task.status}' state.",
+        )
+
+    # Reset task state for retry
     task.status = "SUBMITTED"
-    task.progress_percent = 0
-    task.current_stage = f"Retry #{task.retry_count} queued"
+    task.retry_count += 1
     task.error_message = None
+    task.progress_percent = 0
+    task.current_stage = f"Task queued for retry attempt #{task.retry_count}"
     task.started_at = datetime.utcnow()
     task.completed_at = None
+    task.webodm_task_uuid = None
     db.commit()
 
-    append_task_log(db, task.id, f"Retry attempt #{task.retry_count} initiated by {current_user.email}")
+    append_task_log(db, task.id, f"Task re-dispatched for retry #{task.retry_count} by {current_user.email}")
 
-    # Dispatch execution
+    # Dispatch worker
     trigger_photogrammetry_task(task.id)
 
     survey = db.query(Survey).filter(Survey.id == task.survey_id).first()
-    source_filename = None
-    if task.source_file_id:
-        sfile = db.query(SurveyFile).filter(SurveyFile.id == task.source_file_id).first()
-        if sfile:
-            source_filename = sfile.original_filename
 
     return PhotogrammetryTaskResponse(
         task_id=task.id,
         survey_id=task.survey_id,
         survey_code=survey.survey_code if survey else None,
+        project_id=task.project_id,
+        project_name=task.project.name if task.project else None,
         source_file_id=task.source_file_id,
-        source_filename=source_filename,
-        webodm_task_uuid=task.webodm_task_uuid,
+        source_filename=None,
+        gcp_file_id=task.gcp_file_id,
+        gcp_applied=task.gcp_applied,
+        webodm_task_uuid=None,
         resolution_preset=task.resolution_preset,
         generate_dsm=task.generate_dsm,
         generate_dtm=task.generate_dtm,
         radiometric_calibration=task.radiometric_calibration,
         options=task.options,
         status=task.status,
-        progress_percent=task.progress_percent,
+        progress_percent=0,
         current_stage=task.current_stage,
-        error_message=task.error_message,
+        error_message=None,
         retry_count=task.retry_count,
         started_at=task.started_at,
-        completed_at=task.completed_at,
+        completed_at=None,
         generated_products_count=0,
     )
