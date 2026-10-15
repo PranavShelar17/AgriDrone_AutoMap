@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # 1. PostgreSQL 16 + PostGIS 3.4 Spatial Database
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: agridrone_prod_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agridrone_db}
+      POSTGRES_USER: ${POSTGRES_USER:-agridrone_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5434:5432"
+    volumes:
+      - agridrone_prod_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agridrone_user} -d ${POSTGRES_DB:-agridrone_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # 2. Redis 7.2 Cache & Task Queue Broker
+  redis:
+    image: redis:7.2-alpine
+    container_name: agridrone_prod_redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - agridrone_prod_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # 3. FastAPI Production Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: agridrone_prod_backend
+    ports:
+      - "8005:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-agridrone_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-agridrone_db}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:3005"]}
+      - COOKIE_SECURE=${COOKIE_SECURE:-true}
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - AZURE_STORAGE_ACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT_NAME:-agridronestorage}
+      - WEBODM_API_URL=${WEBODM_API_URL:-http://nodeodm:3000}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # 4. Celery Asynchronous Background Task Worker
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: agridrone_prod_worker
+    command: celery -A app.core.celery_app.celery_app worker -l info -c 4 -Q photogrammetry,raster_analytics
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-agridrone_user}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-agridrone_db}
+      - REDIS_URL=redis://redis:6379/0
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - WEBODM_API_URL=${WEBODM_API_URL:-http://nodeodm:3000}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # 5. Next.js 14 Production Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    container_name: agridrone_prod_frontend
+    ports:
+      - "3005:3005"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8005/api/v1}
+    depends_on:
+      - backend
+    restart: always
+
+  # 6. Optional NodeODM Photogrammetry Node (Activated via profile)
+  nodeodm:
+    image: opendronemap/nodeodm:latest
+    container_name: agridrone_prod_nodeodm
+    ports:
+      - "3001:3000"
+    restart: always
+    profiles:
+      - photogrammetry
+
+volumes:
+  agridrone_prod_postgres_data:
+  agridrone_prod_redis_data:

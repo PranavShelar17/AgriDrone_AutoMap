@@ -1,0 +1,122 @@
+name: AgriDrone AutoMap CI/CD Quality Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend-quality:
+    name: Backend Tests & PostGIS Migrations
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_DB: agridrone_test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: ./backend
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install System Geospatial Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpq-dev libgeos-dev
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate Database Migrations
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5434/agridrone_test_db
+        run: |
+          alembic upgrade head
+
+      - name: Execute Automated Test Suite (Pytest)
+        env:
+          ENVIRONMENT: testing
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5434/agridrone_test_db
+          REDIS_URL: redis://localhost:6380/0
+          SECRET_KEY: ci_pipeline_super_secret_test_key_minimum_32_characters_long
+          ALLOW_DEV_LOCAL_STORAGE: "true"
+        run: |
+          pytest -v
+
+  frontend-quality:
+    name: Frontend Build & Type Validation
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ./frontend
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install NPM Dependencies
+        run: npm ci
+
+      - name: TypeScript Static Type Checking
+        run: npx tsc --noEmit
+
+      - name: Next.js Production Build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+          NEXT_PUBLIC_API_URL: http://localhost:8005/api/v1
+        run: npm run build
+
+  container-validation:
+    name: Docker Configuration & Syntax Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Validate Development Docker Compose
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Validate Production Docker Compose
+        run: docker compose -f docker-compose.prod.yml config --quiet

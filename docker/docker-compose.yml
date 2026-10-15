@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: agridrone_p4_db
+    environment:
+      POSTGRES_DB: agridrone_db
+      POSTGRES_USER: agridrone_user
+      POSTGRES_PASSWORD: local_pass
+    ports:
+      - "5434:5432"
+    volumes:
+      - agridrone_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agridrone_user -d agridrone_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: agridrone_p4_redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - agridrone_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: agridrone_backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8005:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DATABASE_URL=postgresql://agridrone_user:local_pass@db:5432/agridrone_db
+      - REDIS_URL=redis://redis:6379/0
+      - CORS_ORIGINS=["http://localhost:3000","http://localhost:3005"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: agridrone_frontend
+    command: npm run dev -- -p 3005
+    ports:
+      - "3005:3005"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8005/api/v1
+    depends_on:
+      - backend
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+      - /app/.next
+    restart: unless-stopped
+
+volumes:
+  agridrone_postgres_data:
+  agridrone_redis_data:

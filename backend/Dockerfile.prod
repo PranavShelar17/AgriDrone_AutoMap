@@ -1,0 +1,34 @@
+# Production Dockerfile for AgriDrone AutoMap FastAPI Backend
+FROM python:3.11-slim as base
+
+WORKDIR /app
+
+# Install system dependencies for PostgreSQL, GEOS spatial engine, and GDAL
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    libgeos-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create non-root application user for production security hardening
+RUN groupadd -g 10001 appgroup && \
+    useradd -u 10001 -g appgroup -s /bin/bash -m appuser
+
+# Copy application source code
+COPY . .
+
+# Create storage directory and assign ownership to non-root user
+RUN mkdir -p storage/raw-surveys storage/orthomosaics storage/vegetation-indices storage/reports && \
+    chown -R appuser:appgroup /app
+
+USER appuser
+
+EXPOSE 8000
+
+# Production ASGI server with multi-worker concurrency
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
