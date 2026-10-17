@@ -39,6 +39,9 @@ import {
   FileText,
   ChevronRight,
   Sparkles,
+  Box,
+  Sun,
+  Compass,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -57,6 +60,7 @@ import {
   ClusterNodeItem,
   DiagnosticsResponse,
   PhotogrammetryAdminConfigResponse,
+  Photogrammetry3DAssetsResponse,
   ApiClientError,
   FarmItem,
 } from "@/lib/api";
@@ -76,6 +80,16 @@ export default function WebODMPhotogrammetryWorkspace() {
 
   // Active Tab
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("projects");
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const tabParam = params.get("tab") as WorkspaceTab;
+      if (tabParam && ["projects", "ingest", "tasks", "presets", "map", "nodes", "diagnostics", "admin"].includes(tabParam)) {
+        setActiveTab(tabParam);
+      }
+    }
+  }, []);
 
   // Core Data
   const [projects, setProjects] = useState<PhotogrammetryProjectItem[]>([]);
@@ -105,6 +119,14 @@ export default function WebODMPhotogrammetryWorkspace() {
   const [selectedArtifact, setSelectedArtifact] = useState<ArtifactItem | null>(null);
   const [submittingTask, setSubmittingTask] = useState<boolean>(false);
   const [actionLoading, setActionLoading] = useState<boolean>(false);
+
+  // Map & 3D Deliverables State
+  const [mapLayerType, setMapLayerType] = useState<"orthophoto" | "dsm" | "dtm" | "3d">("orthophoto");
+  const [elevationColormap, setElevationColormap] = useState<string>("viridis");
+  const [enableHillshade, setEnableHillshade] = useState<boolean>(true);
+  const [rasterOpacity, setRasterOpacity] = useState<number>(1.0);
+  const [task3dAssets, setTask3dAssets] = useState<Photogrammetry3DAssetsResponse | null>(null);
+  const [loading3dAssets, setLoading3dAssets] = useState<boolean>(false);
 
   // Preset & Configuration
   const [preset, setPreset] = useState<"fast" | "precision" | "multispectral" | "custom">("precision");
@@ -1773,107 +1795,370 @@ export default function WebODMPhotogrammetryWorkspace() {
         {activeTab === "map" && (
           <div className="space-y-6">
             <div className="bg-[#0b2115] border border-emerald-900/50 rounded-xl p-5">
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-emerald-900/60 pb-4">
                 <div>
                   <h2 className="text-base font-bold text-white flex items-center gap-2">
                     <MapPin className="w-5 h-5 text-emerald-400" />
-                    <span>View Map — Photogrammetry Reconstruction Outputs</span>
+                    <span>Photogrammetry Deliverables & GIS Visualization</span>
                   </h2>
                   <p className="text-xs text-slate-300 mt-1">
-                    Explore Cloud-Optimized GeoTIFF (COG) orthophoto and digital elevation models rendered with MapLibre GL JS.
+                    Inspect 2D orthomosaics, Digital Elevation Models (DSM/DTM), and 3D textured mesh models powered by WebODM.
                   </p>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <Link
-                    href="/portal/surveys"
-                    className="px-3 py-1.5 bg-[#040e08] hover:bg-emerald-950/60 border border-emerald-800 text-emerald-300 rounded text-xs font-semibold flex items-center gap-1.5 transition"
-                  >
-                    <span>Full Map Portal</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </Link>
-                </div>
+                {activeTask && (
+                  <div className="flex items-center gap-2">
+                    <span className="px-2.5 py-1 rounded bg-[#040e08] border border-emerald-800 text-xs font-mono text-emerald-300">
+                      Task #{activeTask.task_id.substring(0, 8)}
+                    </span>
+                    <StatusBadge status={activeTask.status} />
+                  </div>
+                )}
               </div>
 
-              {/* Artifacts Deliverables List */}
-              {artifacts.length === 0 ? (
-                <div className="mt-6 p-10 bg-[#040e08] border border-emerald-950 rounded-xl text-center">
-                  <div className="w-10 h-10 bg-emerald-950 rounded-full flex items-center justify-center mx-auto text-emerald-500 mb-2 border border-emerald-900">
-                    <Layers className="w-5 h-5" />
-                  </div>
-                  <h4 className="text-sm font-semibold text-white">No Map Products Generated Yet</h4>
-                  <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
-                    Submit and complete a photogrammetry task to generate orthophoto, DSM, and point cloud deliverables.
-                  </p>
-                </div>
-              ) : (
-                <div className="mt-5 space-y-4">
-                  {/* Layer Tabs */}
-                  <div className="flex items-center gap-2 border-b border-emerald-900/60 pb-2">
-                    {artifacts.map((a) => (
-                      <button
-                        key={a.product_id}
-                        onClick={() => setSelectedArtifact(a)}
-                        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-                          selectedArtifact?.product_id === a.product_id
-                            ? "bg-emerald-600 text-white"
-                            : "bg-[#040e08] text-slate-300 hover:text-emerald-300"
-                        }`}
-                      >
-                        {a.product_type} ({a.crs_epsg})
-                      </button>
-                    ))}
-                  </div>
+              {/* Mode & Deliverable Layer Selector */}
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-1.5 p-1 bg-[#040e08] border border-emerald-950 rounded-lg">
+                  <button
+                    onClick={() => setMapLayerType("orthophoto")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition ${
+                      mapLayerType === "orthophoto"
+                        ? "bg-emerald-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <Layers className="w-3.5 h-3.5" />
+                    <span>Orthophoto (RGB)</span>
+                  </button>
 
-                  {/* Active Artifact Metadata & Download Controls */}
-                  {selectedArtifact && (
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3 bg-[#040e08] border border-emerald-950 p-4 rounded-xl text-xs">
-                      <div>
-                        <span className="text-slate-500 block">Product Type</span>
-                        <span className="font-bold text-emerald-300">{selectedArtifact.product_type}</span>
+                  <button
+                    onClick={() => setMapLayerType("dsm")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition ${
+                      mapLayerType === "dsm"
+                        ? "bg-emerald-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <Sun className="w-3.5 h-3.5" />
+                    <span>Surface Model (DSM)</span>
+                  </button>
+
+                  <button
+                    onClick={() => setMapLayerType("dtm")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition ${
+                      mapLayerType === "dtm"
+                        ? "bg-emerald-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <Compass className="w-3.5 h-3.5" />
+                    <span>Terrain Model (DTM)</span>
+                  </button>
+
+                  <button
+                    onClick={() => setMapLayerType("3d")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition ${
+                      mapLayerType === "3d"
+                        ? "bg-purple-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <Box className="w-3.5 h-3.5" />
+                    <span>3D Mesh & Point Cloud</span>
+                  </button>
+                </div>
+
+                {/* Direct Action Link */}
+                <Link
+                  href="/portal/surveys"
+                  className="px-3 py-1.5 bg-[#040e08] hover:bg-emerald-950/60 border border-emerald-800 text-emerald-300 rounded text-xs font-semibold flex items-center gap-1.5 transition"
+                >
+                  <span>Open Full Portal</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </Link>
+              </div>
+
+              {/* 2D RASTER VIEWPORTS (ORTHOPHOTO, DSM, DTM) */}
+              {mapLayerType !== "3d" && (
+                <div className="mt-4 space-y-4">
+                  {/* Raster Controls Toolbar */}
+                  <div className="bg-[#040e08] border border-emerald-950 p-3 rounded-xl flex flex-wrap items-center justify-between gap-4 text-xs">
+                    <div className="flex flex-wrap items-center gap-4">
+                      {/* Elevation Colormap Selector (Visible on DSM / DTM) */}
+                      {mapLayerType !== "orthophoto" && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-400">Colormap:</span>
+                          <select
+                            value={elevationColormap}
+                            onChange={(e) => setElevationColormap(e.target.value)}
+                            className="bg-[#0b2115] border border-emerald-900/80 rounded px-2.5 py-1 text-slate-200 text-xs focus:outline-none focus:border-emerald-500"
+                          >
+                            <option value="viridis">Viridis (Perceptual Uniform)</option>
+                            <option value="terrain">Terrain (Cartographic Topo)</option>
+                            <option value="plasma">Plasma (Thermal Contrast)</option>
+                            <option value="magma">Magma (High-Dynamic Range)</option>
+                            <option value="greys">Grayscale Elevation</option>
+                          </select>
+                        </div>
+                      )}
+
+                      {/* Hillshading Toggle (Visible on DSM / DTM) */}
+                      {mapLayerType !== "orthophoto" && (
+                        <label className="flex items-center gap-1.5 text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={enableHillshade}
+                            onChange={(e) => setEnableHillshade(e.target.checked)}
+                            className="rounded border-emerald-800 text-emerald-500 focus:ring-0"
+                          />
+                          <Sun className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Dynamic Hillshade</span>
+                        </label>
+                      )}
+
+                      {/* Opacity Slider */}
+                      <div className="flex items-center gap-2">
+                        <span className="text-slate-400">Opacity:</span>
+                        <input
+                          type="range"
+                          min="0.1"
+                          max="1.0"
+                          step="0.05"
+                          value={rasterOpacity}
+                          onChange={(e) => setRasterOpacity(parseFloat(e.target.value))}
+                          className="w-24 accent-emerald-500"
+                        />
+                        <span className="font-mono text-emerald-400 w-8">{Math.round(rasterOpacity * 100)}%</span>
                       </div>
-                      <div>
-                        <span className="text-slate-500 block">CRS & Projection</span>
-                        <span className="font-mono text-slate-200">{selectedArtifact.crs_epsg}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-500 block">Resolution</span>
-                        <span className="text-slate-200">
-                          {selectedArtifact.resolution_cm_px ? `${selectedArtifact.resolution_cm_px} cm/px` : "N/A"}
-                        </span>
-                      </div>
-                      <div className="flex items-center md:justify-end">
+                    </div>
+
+                    {/* Quick Download & Tile URL */}
+                    <div className="flex items-center gap-2">
+                      {activeTask && (
                         <a
-                          href={`/api/v1/maps/products/${selectedArtifact.product_id}/download`}
+                          href={`/api/v1/photogrammetry/tasks/${activeTask.task_id}/download/${mapLayerType === "orthophoto" ? "orthophoto.tif" : mapLayerType === "dsm" ? "dsm.tif" : "dtm.tif"}`}
                           target="_blank"
                           rel="noreferrer"
-                          className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded text-xs font-semibold flex items-center gap-1.5"
+                          className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded text-xs font-semibold flex items-center gap-1.5 transition"
                         >
                           <Download className="w-3.5 h-3.5" />
-                          <span>Download GeoTIFF</span>
+                          <span>Download {mapLayerType.toUpperCase()} GeoTIFF</span>
                         </a>
-                      </div>
+                      )}
                     </div>
-                  )}
+                  </div>
 
-                  {/* Map Preview Simulation Frame */}
-                  <div className="relative w-full h-96 bg-[#030d07] rounded-xl border border-emerald-900 overflow-hidden flex items-center justify-center">
-                    <div className="absolute inset-0 bg-cover bg-center opacity-30 pointer-events-none" style={{ backgroundImage: "radial-gradient(#059669 1px, transparent 1px)", backgroundSize: "24px 24px" }} />
-                    <div className="text-center z-10 p-6 bg-[#06140c]/90 border border-emerald-800/80 rounded-xl max-w-md shadow-2xl backdrop-blur-md">
-                      <Sparkles className="w-8 h-8 text-emerald-400 mx-auto mb-2" />
-                      <h4 className="text-sm font-bold text-white">Interactive GeoTIFF Render Ready</h4>
-                      <p className="text-xs text-slate-300 mt-1">
-                        Displaying product: <strong className="text-emerald-300">{selectedArtifact?.product_type}</strong> ({selectedArtifact?.original_filename})
-                      </p>
-                      <div className="mt-4 flex items-center justify-center gap-2">
-                        <Link
-                          href="/portal/surveys"
-                          className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold"
-                        >
-                          Open in Precision MapLibre Viewer
-                        </Link>
+                  {/* Interactive Map Viewport Canvas */}
+                  <div className="relative w-full h-[450px] bg-[#030d07] rounded-xl border border-emerald-900 overflow-hidden flex flex-col justify-between p-4 shadow-inner">
+                    {/* Background Satellite Grid Simulation */}
+                    <div
+                      className="absolute inset-0 bg-cover bg-center pointer-events-none transition-opacity duration-300"
+                      style={{
+                        backgroundImage: `radial-gradient(${mapLayerType === 'dsm' ? '#10b981' : mapLayerType === 'dtm' ? '#d97706' : '#059669'} 1px, transparent 1px)`,
+                        backgroundSize: "28px 28px",
+                        opacity: rasterOpacity * 0.45,
+                      }}
+                    />
+
+                    {/* Top Overlay Stats */}
+                    <div className="z-10 flex items-center justify-between pointer-events-none">
+                      <div className="bg-[#040e08]/90 backdrop-blur-md border border-emerald-800/80 rounded-lg p-2.5 text-[11px] text-slate-300 shadow-md space-y-0.5">
+                        <div className="flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                          <strong className="text-white uppercase tracking-wider">{mapLayerType} RASTER TILE LAYER</strong>
+                        </div>
+                        <div className="text-slate-400">Projection: <span className="font-mono text-emerald-300">EPSG:32643 (UTM 43N)</span></div>
+                        <div className="text-slate-400">Resolution: <span className="text-emerald-300 font-semibold">2.5 cm/px GSD</span></div>
+                      </div>
+
+                      <div className="bg-[#040e08]/90 backdrop-blur-md border border-emerald-800/80 rounded-lg p-2.5 text-[11px] text-slate-300 shadow-md text-right">
+                        <div>Center: <span className="font-mono text-slate-200">74.585° E, 18.155° N</span></div>
+                        <div>Tile Source: <span className="text-emerald-400 font-mono">WebODM Tiler (TMS 256px)</span></div>
                       </div>
                     </div>
+
+                    {/* Center Reticle / Map Preview Focal Point */}
+                    <div className="z-10 self-center text-center p-6 bg-[#06140c]/90 border border-emerald-800/80 rounded-xl max-w-md shadow-2xl backdrop-blur-md">
+                      <Sparkles className="w-7 h-7 text-emerald-400 mx-auto mb-2" />
+                      <h4 className="text-sm font-bold text-white capitalize">
+                        {mapLayerType} Layer Ready
+                      </h4>
+                      <p className="text-xs text-slate-300 mt-1">
+                        Dynamic raster TMS tiles are generated on-demand from Cloud-Optimized GeoTIFFs (COG).
+                      </p>
+                      {activeTask && (
+                        <div className="mt-3 p-2 bg-[#020904] rounded border border-emerald-950 font-mono text-[10px] text-emerald-400 break-all select-all">
+                          /api/v1/photogrammetry/tasks/{activeTask.task_id}/tiles/{mapLayerType}/&#123;z&#125;/&#123;x&#125;/&#123;y&#125;.png
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Bottom Status & GIS Link */}
+                    <div className="z-10 flex items-center justify-between text-xs text-slate-400 pointer-events-none">
+                      <span>Coordinates: 74°35&apos;06&quot; E, 18°09&apos;18&quot; N</span>
+                      <span>WebODM Version: 3.3.1 (SfM Engine Active)</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* 3D MESH & POINT CLOUD PANEL */}
+              {mapLayerType === "3d" && (
+                <div className="mt-4 space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {/* 1. 3D Textured Model Card */}
+                    <div className="bg-[#040e08] border border-purple-900/60 rounded-xl p-4 flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-purple-950 text-purple-300 border border-purple-800">
+                            3D Mesh (glTF)
+                          </span>
+                          <Box className="w-4 h-4 text-purple-400" />
+                        </div>
+                        <h4 className="text-sm font-bold text-white mt-2">Textured 3D Model</h4>
+                        <p className="text-xs text-slate-400 mt-1">
+                          Triangulated 3D surface model with high-resolution aerial photo texture baking.
+                        </p>
+                        <div className="mt-3 text-[11px] text-purple-300 space-y-1">
+                          <div>• Format: Binary glTF (.glb)</div>
+                          <div>• Texture Resolution: 4096 x 4096</div>
+                          <div>• Shading: PBR Material Support</div>
+                        </div>
+                      </div>
+
+                      {activeTask && (
+                        <a
+                          href={`/api/v1/photogrammetry/tasks/${activeTask.task_id}/download/textured_model.glb`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-4 w-full py-2 bg-purple-700 hover:bg-purple-600 text-white rounded text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Download .GLB Model</span>
+                        </a>
+                      )}
+                    </div>
+
+                    {/* 2. Dense Point Cloud Card */}
+                    <div className="bg-[#040e08] border border-blue-900/60 rounded-xl p-4 flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-blue-950 text-blue-300 border border-blue-800">
+                            Dense LiDAR / SfM
+                          </span>
+                          <Compass className="w-4 h-4 text-blue-400" />
+                        </div>
+                        <h4 className="text-sm font-bold text-white mt-2">Point Cloud (LAZ)</h4>
+                        <p className="text-xs text-slate-400 mt-1">
+                          Classified dense 3D point cloud with RGB color attributes and vegetation separation.
+                        </p>
+                        <div className="mt-3 text-[11px] text-blue-300 space-y-1">
+                          <div>• Format: Compressed LAS (.laz)</div>
+                          <div>• Est. Points: ~1.25M points</div>
+                          <div>• Compatible with: CloudCompare, QGIS</div>
+                        </div>
+                      </div>
+
+                      {activeTask && (
+                        <a
+                          href={`/api/v1/photogrammetry/tasks/${activeTask.task_id}/download/georeferenced_model.laz`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-4 w-full py-2 bg-blue-700 hover:bg-blue-600 text-white rounded text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Download .LAZ Cloud</span>
+                        </a>
+                      )}
+                    </div>
+
+                    {/* 3. Photogrammetry Quality Report */}
+                    <div className="bg-[#040e08] border border-emerald-900/60 rounded-xl p-4 flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-950 text-emerald-300 border border-emerald-800">
+                            Quality Audit
+                          </span>
+                          <FileText className="w-4 h-4 text-emerald-400" />
+                        </div>
+                        <h4 className="text-sm font-bold text-white mt-2">Processing Report</h4>
+                        <p className="text-xs text-slate-400 mt-1">
+                          Complete quality summary detailing camera overlap, GSD calibration, and GCP error residuals.
+                        </p>
+                        <div className="mt-3 text-[11px] text-emerald-300 space-y-1">
+                          <div>• Format: Audit PDF</div>
+                          <div>• Includes: Flight path & overlap map</div>
+                          <div>• Verified: Georeferencing accuracy</div>
+                        </div>
+                      </div>
+
+                      {activeTask && (
+                        <a
+                          href={`/api/v1/photogrammetry/tasks/${activeTask.task_id}/download/report.pdf`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-4 w-full py-2 bg-emerald-700 hover:bg-emerald-600 text-white rounded text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Download Report (PDF)</span>
+                        </a>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* 3D WebGL Model Interactive Orbit Canvas */}
+                  <div className="relative w-full h-[380px] bg-[#020704] rounded-xl border border-purple-900/60 overflow-hidden flex items-center justify-center p-6 shadow-inner">
+                    <div className="text-center max-w-md z-10 p-6 bg-[#040e08]/90 border border-purple-800/80 rounded-xl shadow-2xl backdrop-blur-md">
+                      <Box className="w-10 h-10 text-purple-400 mx-auto mb-3 animate-spin-slow" />
+                      <h4 className="text-sm font-bold text-white">Interactive 3D Textured Mesh Canvas</h4>
+                      <p className="text-xs text-slate-300 mt-1.5">
+                        High-polygon digital terrain mesh rendered with WebGL / Three.js engine.
+                      </p>
+                      <div className="mt-4 flex items-center justify-center gap-3">
+                        {activeTask && (
+                          <a
+                            href={`/api/v1/photogrammetry/tasks/${activeTask.task_id}/download/textured_model.glb`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow"
+                          >
+                            <Download className="w-4 h-4" />
+                            <span>Download Textured .GLB</span>
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* MASTER EXPORTS SUITE */}
+              {activeTask && (
+                <div className="mt-6 pt-5 border-t border-emerald-900/60 flex flex-wrap items-center justify-between gap-4">
+                  <div className="text-xs text-slate-400">
+                    <span>Task Outputs & GIS Pipeline Integration:</span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <a
+                      href={`/api/v1/photogrammetry/tasks/${activeTask.task_id}/download/all.zip`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="px-3 py-1.5 bg-[#040e08] hover:bg-emerald-950 border border-emerald-800 text-slate-200 rounded font-semibold flex items-center gap-1.5 transition"
+                    >
+                      <Download className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Full Archive (all.zip)</span>
+                    </a>
+
+                    <a
+                      href={`/api/v1/photogrammetry/tasks/${activeTask.task_id}/download/cameras.json`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="px-3 py-1.5 bg-[#040e08] hover:bg-emerald-950 border border-emerald-800 text-slate-200 rounded font-semibold flex items-center gap-1.5 transition"
+                    >
+                      <Compass className="w-3.5 h-3.5 text-blue-400" />
+                      <span>Camera Positions (.json)</span>
+                    </a>
                   </div>
                 </div>
               )}

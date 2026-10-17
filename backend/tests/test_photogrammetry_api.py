@@ -75,7 +75,7 @@ def test_photogrammetry_task_full_api_lifecycle():
     assert bad_res.status_code == 404
 
     # 3. Create Task with Mocked WebODM execution
-    with patch("app.tasks.photogrammetry.trigger_photogrammetry_task", return_value=True):
+    with patch("app.api.v1.endpoints.photogrammetry.trigger_photogrammetry_task", return_value=True):
         task_payload = {
             "survey_id": survey_id,
             "source_file_id": file_id,

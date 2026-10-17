@@ -64,3 +64,8 @@ backend/storage/raw-surveys/*
 !backend/storage/raw-surveys/.gitkeep
 backend/storage/vegetation-indices/*
 !backend/storage/vegetation-indices/.gitkeep
+
+# Third-party upstream source archives
+WebODM-master/
+*.zip
+

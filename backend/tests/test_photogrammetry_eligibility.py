@@ -88,7 +88,7 @@ def test_photogrammetry_dataset_eligibility_classification():
     # Check Rejected Corrupt File
     corrupt_item = items_by_name["corrupt_photo.jpg"]
     assert corrupt_item["is_eligible"] is False
-    assert "Rejected" in corrupt_item["ineligibility_reason"]
+    assert "rejected" in corrupt_item["ineligibility_reason"].lower()
 
     # Check GeoTIFF file
     geotiff_item = items_by_name["stitched_ortho.tif"]

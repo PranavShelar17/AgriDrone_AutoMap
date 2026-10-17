@@ -157,6 +157,24 @@ Complete technical blueprints and requirements are documented in the `docs/` dir
 11. [Phase 6 Known Limitations](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/phase-6/phase-6-known-limitations.md) — Hardware limits, offline cluster handling, and strict Phase 6 boundaries.
 12. [Phase 7 Readiness Checklist](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/phase-6/phase-7-readiness-checklist.md) — Prerequisites and scope hand-off for Spectral Algorithms & Multi-Map Generation.
 
+### WebODM Photogrammetry Integration Suite (Comprehensive Architecture & Capabilities)
+1. [Source Code Audit](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/source-code-audit.md) — Full inspection of WebODM 3.3.1 Django viewsets, Celery workers, tiler, and models.
+2. [Feature Inventory](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/feature-inventory.md) — Comprehensive capability inventory across Groups A through O.
+3. [Integration Architecture](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/integration-architecture.md) — FastAPI gateway, asynchronous Celery bridge, and storage synchronization.
+4. [Implementation Plan](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/implementation-plan.md) — 17-step phased roadmap.
+5. [API Contracts](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/api-contracts.md) — Endpoints for projects, tasks, GCP, options schema, presets, tiles proxy, and 3D assets.
+6. [Project & Task Workflows](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/project-and-task-workflows.md) — Lifecycle, state transitions, concurrency, and failure recovery.
+7. [Image & GCP Workflows](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/image-and-gcp-workflows.md) — Aerial classification, OpenDroneMap GCP format (`gcp_list.txt`), and validation algorithms.
+8. [Output & Map Delivery](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/output-and-map-delivery.md) — COG conversion, dynamic tile serving proxy, bounds, metadata, and MapLibre GL JS integration.
+9. [Advanced Visualization](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/advanced-visualization.md) — 3D textured meshes (`.glb`), dense point clouds (`.laz`), Potree, 3D Gaussian splats, panoramas, and colormaps.
+10. [Processing Node Management](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/processing-node-management.md) — NodeODM telemetry, capacity, options schema discovery, and administrator RBAC.
+11. [Security & Permissions](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/security-and-permissions.md) — Full RBAC matrix, tile proxy authentication, downloads, and anti-IDOR protections.
+12. [Azure Storage Integration](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/azure-storage-integration.md) — Container hierarchy, block-blob transfers, and short-lived SAS link security.
+13. [License & Third-Party Inventory](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/license-and-third-party-inventory.md) — AGPL-3.0 compliance boundaries, UAV4GEO trademark compliance, and third-party software inventory.
+14. [Test Results Report](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/test-results.md) — 17 passing integration tests (100% pass) and frontend build verification.
+15. [Known Limitations](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/known-limitations.md) — WebODM vs NodeODM, 3D Gaussian splat GPU prerequisites, multispectral camera calibration, and RAM thresholds.
+16. [Feature Coverage Matrix](file:///c:/Users/Admin/Desktop/new%20dron%202/docs/webodm-integration/feature-coverage-matrix.md) — 28-item status verification matrix across Groups A through O.
+
 ---
 
 ## 6. Local Development Quick-Start

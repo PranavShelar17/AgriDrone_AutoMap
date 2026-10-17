@@ -280,6 +280,52 @@ export interface PhotogrammetryAdminConfigResponse {
   supported_presets: string[];
 }
 
+export interface Photogrammetry3DAssetsResponse {
+  task_id: string;
+  status: string;
+  textured_mesh: {
+    format: string;
+    available: boolean;
+    filename: string;
+    download_url?: string | null;
+  };
+  point_cloud: {
+    format: string;
+    available: boolean;
+    filename: string;
+    download_url?: string | null;
+    estimated_points: number;
+  };
+  quality_report: {
+    format: string;
+    available: boolean;
+    filename: string;
+    download_url?: string | null;
+  };
+}
+
+export interface PhotogrammetryOptionSchemaItem {
+  name: string;
+  type: string;
+  default?: any;
+  choices?: string[];
+  description: string;
+}
+
+export interface PhotogrammetryPresetItem {
+  id: number;
+  name: string;
+  code: string;
+  description: string;
+  target_gsd_cm: number;
+  dsm: boolean;
+  dtm: boolean;
+  feature_quality: string;
+  pc_quality: string;
+  radiometric_calibration?: string;
+  recommended_for: string;
+}
+
 export interface PhotogrammetryTaskCreate {
   survey_id: string;
   source_file_id?: string;
@@ -1050,6 +1096,38 @@ export const api = {
 
   async getPhotogrammetryAdminConfig(): Promise<PhotogrammetryAdminConfigResponse> {
     return this.get<PhotogrammetryAdminConfigResponse>('/photogrammetry/admin/config');
+  },
+
+  async getPhotogrammetryOptionsSchema(): Promise<PhotogrammetryOptionSchemaItem[]> {
+    return this.get<PhotogrammetryOptionSchemaItem[]>('/photogrammetry/options/schema');
+  },
+
+  async getPhotogrammetryPresets(): Promise<PhotogrammetryPresetItem[]> {
+    return this.get<PhotogrammetryPresetItem[]>('/photogrammetry/presets');
+  },
+
+  async getPhotogrammetry3DAssets(taskId: string): Promise<Photogrammetry3DAssetsResponse> {
+    return this.get<Photogrammetry3DAssetsResponse>(`/photogrammetry/tasks/${taskId}/3d-assets`);
+  },
+
+  async getPhotogrammetryRasterBounds(taskId: string, tileType: string = 'orthophoto'): Promise<{ task_id: string; tile_type: string; bounds: [number, number, number, number] }> {
+    return this.get<{ task_id: string; tile_type: string; bounds: [number, number, number, number] }>(`/photogrammetry/tasks/${taskId}/tiles/${tileType}/bounds`);
+  },
+
+  async getPhotogrammetryRasterMetadata(taskId: string, tileType: string = 'orthophoto'): Promise<Record<string, any>> {
+    return this.get<Record<string, any>>(`/photogrammetry/tasks/${taskId}/tiles/${tileType}/metadata`);
+  },
+
+  getPhotogrammetryTileUrlTemplate(taskId: string, tileType: string = 'orthophoto', params?: { colormap?: string; hillshade?: boolean }): string {
+    const query = new URLSearchParams();
+    if (params?.colormap) query.set('colormap', params.colormap);
+    if (params?.hillshade) query.set('hillshade', '1');
+    const qs = query.toString();
+    return `${config.apiBaseUrl}/photogrammetry/tasks/${encodeURIComponent(taskId)}/tiles/${tileType}/{z}/{x}/{y}.png${qs ? `?${qs}` : ''}`;
+  },
+
+  getPhotogrammetryAssetDownloadUrl(taskId: string, assetName: string): string {
+    return `${config.apiBaseUrl}/photogrammetry/tasks/${encodeURIComponent(taskId)}/download/${encodeURIComponent(assetName)}`;
   },
 
   // --- Phase 7 Algorithms & Raster Analytics ---
